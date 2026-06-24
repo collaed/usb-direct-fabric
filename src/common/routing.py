@@ -26,37 +26,65 @@ class RoutingTable:
         """Register directly connected neighbor on given port."""
         self._neighbors[neighbor_id] = port
         self._routes[neighbor_id] = port
+        # Incrementally update ring rather than discarding it
         if neighbor_id not in self._ring:
-            self._ring = []  # invalidate until recompute
+            self._ring.append(neighbor_id)
+        if self.node_id not in self._ring:
+            self._ring.append(self.node_id)
+        self.recompute()
 
     def remove_neighbor(self, neighbor_id: int):
-        """Remove a dead neighbor."""
+        """Remove a dead neighbor.
+
+        After removal, ring positions shift (e.g. [1,2,3,4] → [1,2,4]).
+        The routing math still works: distances are computed mod len(ring),
+        so remaining nodes get correct shorter/longer path assignments.
+        """
         self._neighbors.pop(neighbor_id, None)
         self._routes.pop(neighbor_id, None)
         self._ring = [n for n in self._ring if n != neighbor_id]
         self.recompute()
 
     def get_next_hop(self, dst: int) -> Optional[str]:
-        """Return port name for next hop toward dst, or None if unreachable."""
-        if dst == 0xFF:  # broadcast: send on all ports (caller handles)
-            return 'host'
+        """Return port name for next hop toward dst, or None if unreachable.
+
+        Returns None for broadcast (0xFF) — the caller MUST handle broadcast
+        by sending on ALL ports except the ingress port. Returning a single
+        port for broadcast would silently drop it on all other links.
+        """
+        if dst == 0xFF:
+            return None  # broadcast: caller sends on all ports
         return self._routes.get(dst)
 
+    def get_all_ports(self) -> list[str]:
+        """Return all connected port names (for broadcast forwarding)."""
+        return list(set(self._neighbors.values()))
+
     def update_from_hello(self, hello_path: list[int]):
-        """Learn ring membership from a forwarded HELLO's node list."""
-        # Merge into ring: the hello_path is an ordered traversal
-        seen = set(self._ring)
-        for nid in hello_path:
-            if nid not in seen:
-                self._ring.append(nid)
-                seen.add(nid)
-        if self.node_id not in seen:
+        """Learn ring membership from a forwarded HELLO's node list.
+
+        The HELLO path represents an authoritative ring traversal from the
+        originator. If it contains more nodes than we currently know, adopt
+        its ordering wholesale. This ensures consistent ring direction across
+        all nodes once a HELLO completes a full traversal.
+        """
+        if len(hello_path) >= len(self._ring):
+            # HELLO has equal or better topology knowledge — adopt its order
+            self._ring = list(hello_path)
+        else:
+            # Partial HELLO (fewer nodes than we know) — merge new nodes only
+            seen = set(self._ring)
+            for nid in hello_path:
+                if nid not in seen:
+                    self._ring.append(nid)
+                    seen.add(nid)
+        if self.node_id not in self._ring:
             self._ring.append(self.node_id)
         self.recompute()
 
     def recompute(self):
         """Rebuild routes. For ring: shortest direction to each destination."""
-        if not self._ring:
+        if not self._ring or len(self._ring) < 2:
             # Fallback: only direct neighbors known
             self._routes = dict(self._neighbors)
             return
@@ -72,7 +100,6 @@ class RoutingTable:
         except ValueError:
             return
 
-        # Identify clockwise port and counter-clockwise port
         # Convention: 'host' = clockwise (toward next in ring), 'gadget' = counter-clockwise
         cw_port = 'host'
         ccw_port = 'gadget'
@@ -80,7 +107,6 @@ class RoutingTable:
         for i, nid in enumerate(ring):
             if nid == self.node_id:
                 continue
-            # Clockwise distance
             cw_dist = (i - my_idx) % n
             ccw_dist = (my_idx - i) % n
             if cw_dist <= ccw_dist:
@@ -94,6 +120,14 @@ class RoutingTable:
 
 
 class NeighborMonitor:
+    """Monitors neighbor liveness via heartbeat timestamps.
+
+    Contract: check_dead() returns dead neighbors and removes them from
+    tracking. After a neighbor is reported dead, it will NOT be reported
+    again unless heartbeat_received() is called (re-registering it).
+    Use forget() for explicit cleanup without a death report.
+    """
+
     def __init__(self, timeout_ms: int = 500):
         self.timeout_ms = timeout_ms
         self._last_seen: dict[int, float] = {}
@@ -103,16 +137,24 @@ class NeighborMonitor:
         self._last_seen[neighbor_id] = time.monotonic()
 
     def check_dead(self) -> list[int]:
-        """Return list of neighbors that have timed out."""
+        """Return list of neighbors that have timed out, and remove them from tracking."""
         now = time.monotonic()
         threshold = self.timeout_ms / 1000.0
-        return [nid for nid, ts in self._last_seen.items()
+        dead = [nid for nid, ts in self._last_seen.items()
                 if (now - ts) > threshold]
+        for nid in dead:
+            del self._last_seen[nid]
+        return dead
+
+    def forget(self, neighbor_id: int):
+        """Stop tracking a neighbor without reporting it as dead."""
+        self._last_seen.pop(neighbor_id, None)
 
 
 # -- HELLO frame helpers --
 
 _HELLO_MAGIC = 0x48  # 'H' prefix in payload to identify HELLO
+
 
 def make_hello(node_id: int, known_nodes: list[int], seq: int) -> bytes:
     """Pack a HELLO frame: regular UDF frame with special payload.
@@ -135,55 +177,64 @@ def parse_hello(f: frame.Frame) -> tuple[int, list[int]]:
 
 
 if __name__ == '__main__':
-    """Self-test: create a 4-node ring, verify shortest paths."""
     print("=== Routing self-test: 4-node ring ===")
-    # Ring: 1 → 2 → 3 → 4 → (back to 1)
     ring_order = [1, 2, 3, 4]
 
     results = []
     for nid in ring_order:
         rt = RoutingTable(nid)
-        # Each node has two neighbors in the ring
         idx = ring_order.index(nid)
         cw_neighbor = ring_order[(idx + 1) % 4]
         ccw_neighbor = ring_order[(idx - 1) % 4]
         rt.add_neighbor(cw_neighbor, 'host')
         rt.add_neighbor(ccw_neighbor, 'gadget')
-        # Simulate receiving HELLO with full ring
         rt.update_from_hello(ring_order)
         results.append((nid, rt))
 
-    # Verify routing for node 1
+    # Verify node 1
     rt1 = results[0][1]
-    # Node 1 → Node 2: clockwise (1 hop) = host
-    assert rt1.get_next_hop(2) == 'host', f"1→2 got {rt1.get_next_hop(2)}"
-    # Node 1 → Node 4: counter-clockwise (1 hop) = gadget
-    assert rt1.get_next_hop(4) == 'gadget', f"1→4 got {rt1.get_next_hop(4)}"
-    # Node 1 → Node 3: equidistant (2 hops either way) — cw wins (<=)
-    assert rt1.get_next_hop(3) == 'host', f"1→3 got {rt1.get_next_hop(3)}"
+    assert rt1.get_next_hop(2) == 'host'
+    assert rt1.get_next_hop(3) == 'host'   # equidistant, cw wins
+    assert rt1.get_next_hop(4) == 'gadget'
     print(f"  Node 1 routes: 2→host ✓, 3→host ✓, 4→gadget ✓")
 
-    # Verify routing for node 3
+    # Verify node 3
     rt3 = results[2][1]
-    assert rt3.get_next_hop(4) == 'host', f"3→4 got {rt3.get_next_hop(4)}"
-    assert rt3.get_next_hop(2) == 'gadget', f"3→2 got {rt3.get_next_hop(2)}"
-    assert rt3.get_next_hop(1) == 'host', f"3→1 got {rt3.get_next_hop(1)}"
+    assert rt3.get_next_hop(4) == 'host'
+    assert rt3.get_next_hop(2) == 'gadget'
+    assert rt3.get_next_hop(1) == 'host'   # equidistant, cw wins
     print(f"  Node 3 routes: 4→host ✓, 2→gadget ✓, 1→host ✓")
 
-    # Test HELLO pack/parse roundtrip
+    # Broadcast returns None (caller must handle)
+    assert rt1.get_next_hop(0xFF) is None
+    assert rt1.get_all_ports() == ['host', 'gadget'] or set(rt1.get_all_ports()) == {'host', 'gadget'}
+    print(f"  Broadcast: get_next_hop(0xFF)=None ✓, get_all_ports()={rt1.get_all_ports()} ✓")
+
+    # HELLO roundtrip
     hello_raw = make_hello(1, [1, 2, 3, 4], seq=0)
     hello_frame = frame.unpack(hello_raw)
     orig, nodes = parse_hello(hello_frame)
     assert orig == 1 and nodes == [1, 2, 3, 4]
     print(f"  HELLO roundtrip: originator={orig}, nodes={nodes} ✓")
 
-    # Test NeighborMonitor
+    # NeighborMonitor: timeout + idempotency
     mon = NeighborMonitor(timeout_ms=100)
     mon.heartbeat_received(2)
     assert mon.check_dead() == []
     time.sleep(0.15)
     dead = mon.check_dead()
     assert 2 in dead
-    print(f"  NeighborMonitor: timeout detected ✓")
+    # Second call should NOT return 2 again (removed after first report)
+    assert mon.check_dead() == []
+    print(f"  NeighborMonitor: timeout detected ✓, idempotent ✓")
+
+    # add_neighbor preserves ring
+    rt = RoutingTable(1)
+    rt.add_neighbor(2, 'host')
+    rt.update_from_hello([1, 2, 3, 4])
+    assert rt.get_next_hop(4) == 'gadget'  # via ring
+    rt.add_neighbor(4, 'gadget')           # should NOT discard ring knowledge
+    assert rt.get_next_hop(3) == 'host'    # still knows about node 3
+    print(f"  add_neighbor preserves ring ✓")
 
     print("\n=== All routing tests passed ===")

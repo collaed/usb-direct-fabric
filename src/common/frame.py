@@ -61,7 +61,7 @@ def pack(src: int, dst: int, seq: int, payload: bytes = b'',
     plen = len(payload)
     padded = _pad16(plen)
     hdr = struct.pack('<2sBBI', MAGIC, flags, hop, seq)
-    routing = struct.pack('<BBH I', src, dst, plen, 0)
+    routing = struct.pack('<BBHI', src, dst, plen, 0)
     body = payload.ljust(padded, b'\x00') if padded else b''
     raw = hdr + routing + body
     crc = zlib.crc32(raw) & 0xFFFFFFFF
@@ -75,7 +75,7 @@ def unpack(data: bytes) -> Frame:
     if data[0:2] != MAGIC:
         raise ValueError(f"Bad magic: {data[0:2]!r}")
     flags, hop, seq = struct.unpack_from('<BBI', data, 2)
-    src, dst, plen, _ = struct.unpack_from('<BBH I', data, 8)
+    src, dst, plen, _ = struct.unpack_from('<BBHI', data, 8)
     padded = _pad16(plen)
     expected = HDR_SIZE + padded + CRC_SIZE
     if len(data) < expected:
@@ -168,7 +168,7 @@ def pack_authenticated(src: int, dst: int, seq: int, payload: bytes,
     plen = len(payload)
     padded = _pad16(plen)
     hdr = struct.pack('<2sBBI', MAGIC, flags, hop, seq)
-    routing = struct.pack('<BBH I', src, dst, plen, 0)
+    routing = struct.pack('<BBHI', src, dst, plen, 0)
     header = hdr + routing
     body = payload.ljust(padded, b'\x00') if padded else b''
     tag = _compute_tag(key, header, body)
@@ -185,7 +185,7 @@ def unpack_authenticated(data: bytes, key: bytes) -> Frame:
     if data[0:2] != MAGIC:
         raise ValueError(f"Bad magic: {data[0:2]!r}")
     flags, hop, seq = struct.unpack_from('<BBI', data, 2)
-    src, dst, plen, _ = struct.unpack_from('<BBH I', data, 8)
+    src, dst, plen, _ = struct.unpack_from('<BBHI', data, 8)
     padded = _pad16(plen)
     expected = HDR_SIZE + padded + AUTH_TAG_SIZE + CRC_SIZE
     if len(data) < expected:
