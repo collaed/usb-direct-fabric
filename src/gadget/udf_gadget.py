@@ -137,12 +137,13 @@ class GadgetDaemon:
             t.start()
 
     def _wait_for_enable(self):
-        """Read ep0 events until FUNCTIONFS_ENABLE (or timeout)."""
+        """Read ep0 events until FUNCTIONFS_ENABLE (or timeout).
+        The kernel may batch multiple events in a single read."""
         for _ in range(50):  # 5 seconds max
             try:
-                data = os.read(self.ep0_fd, FFS_EVENT_SIZE)
-                if len(data) >= 1:
-                    event_type = data[0]
+                data = os.read(self.ep0_fd, FFS_EVENT_SIZE * 8)  # up to 8 events
+                for i in range(0, len(data), FFS_EVENT_SIZE):
+                    event_type = data[i]
                     if self.verbose:
                         print(f"[UDF] ep0 event: {event_type}")
                     if event_type == FUNCTIONFS_ENABLE:
@@ -248,10 +249,13 @@ class GadgetDaemon:
                     self.bytes_tx += len(data)
 
     def _hb_loop(self):
-        """Enqueue heartbeat frames every 100ms (goes through tx_queue)."""
+        """Enqueue heartbeat frames every 100ms (goes through tx_queue).
+        Uses dst=0xFF (broadcast) so receivers always recognise it as a
+        liveness signal regardless of topology. In ring deployments,
+        implementations SHOULD set dst to the direct neighbor's ID instead."""
         while self.running:
             hb = frame.make_heartbeat(src=self.node_id, seq=self._next_seq(),
-                                      dst=self.node_id)
+                                      dst=0xFF)
             self.tx_queue.put(hb)
             time.sleep(0.1)
 
