@@ -229,14 +229,23 @@ class GadgetDaemon:
                 data = self.tx_queue.get(timeout=0.05)
             except queue.Empty:
                 continue
-            try:
-                os.write(self.ep1_fd, data)
+            # Handle partial writes — FunctionFS may not accept full buffer
+            # if hardware FIFO is full or host is slow to poll
+            written = 0
+            while written < len(data) and self.running:
+                try:
+                    n = os.write(self.ep1_fd, data[written:])
+                    written += n
+                except BlockingIOError:
+                    time.sleep(0.001)
+                except OSError:
+                    if self.running:
+                        time.sleep(0.01)
+                    break
+            if written == len(data):
                 with self._lock:
                     self.frames_tx += 1
                     self.bytes_tx += len(data)
-            except OSError:
-                if self.running:
-                    time.sleep(0.01)
 
     def _hb_loop(self):
         """Enqueue heartbeat frames every 100ms (goes through tx_queue)."""

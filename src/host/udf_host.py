@@ -161,7 +161,7 @@ class UDFHost:
             with self._lock:
                 seq = self._tx_seq
                 self._tx_seq += 1
-            hb = frame.pack_heartbeat(seq, self.node_id)
+            hb = frame.make_heartbeat(src=self.node_id, seq=seq)
             self._bulk_write(hb)
             time.sleep(0.1)
 
