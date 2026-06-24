@@ -20,6 +20,17 @@ HAS_FS_DESC = 0x01
 HAS_HS_DESC = 0x02
 HAS_SS_DESC = 0x04
 
+# FunctionFS event types
+FUNCTIONFS_BIND = 0
+FUNCTIONFS_UNBIND = 1
+FUNCTIONFS_ENABLE = 2
+FUNCTIONFS_DISABLE = 3
+FUNCTIONFS_SETUP = 4
+FUNCTIONFS_SUSPEND = 5
+FUNCTIONFS_RESUME = 6
+# Event struct: type(1) + pad(3) + u(8) = 12 bytes
+FFS_EVENT_SIZE = 12
+
 # USB descriptor types
 DT_INTERFACE = 4
 DT_ENDPOINT = 5
@@ -30,64 +41,43 @@ IFACE_CLASS = 0xFF
 IFACE_SUBCLASS = 0x01
 IFACE_PROTOCOL = 0x01
 
-# Frame flags
-FLAG_HB = 0x10
-
 
 def _interface_desc():
-    """Interface descriptor: 9 bytes."""
     return struct.pack('<BBBBBBBBB',
                        9, DT_INTERFACE, 0, 0, 2,
                        IFACE_CLASS, IFACE_SUBCLASS, IFACE_PROTOCOL, 0)
 
 
 def _ep_bulk_out(max_pkt):
-    """Bulk OUT endpoint descriptor: 7 bytes."""
     return struct.pack('<BBBBHB', 7, DT_ENDPOINT, 0x01, 0x02, max_pkt, 0)
 
 
 def _ep_bulk_in(max_pkt):
-    """Bulk IN endpoint descriptor: 7 bytes."""
     return struct.pack('<BBBBHB', 7, DT_ENDPOINT, 0x81, 0x02, max_pkt, 0)
 
 
 def _ss_companion(max_burst=15):
-    """SuperSpeed endpoint companion descriptor: 6 bytes."""
     return struct.pack('<BBBBH', 6, DT_SS_EP_COMPANION, max_burst, 0x00, 0)
 
 
 def build_descriptors():
-    """Build FunctionFS v2 descriptors blob."""
-    # FS descriptors (bulk max 64)
     fs = _interface_desc() + _ep_bulk_out(64) + _ep_bulk_in(64)
-    fs_count = 3
-
-    # HS descriptors (bulk max 512)
     hs = _interface_desc() + _ep_bulk_out(512) + _ep_bulk_in(512)
-    hs_count = 3
-
-    # SS descriptors (bulk max 1024 + companion)
     ss = (_interface_desc()
           + _ep_bulk_out(1024) + _ss_companion()
           + _ep_bulk_in(1024) + _ss_companion())
-    ss_count = 5
-
-    body = struct.pack('<III', fs_count, hs_count, ss_count) + fs + hs + ss
+    body = struct.pack('<III', 3, 3, 5) + fs + hs + ss
     header = struct.pack('<III', DESCRIPTORS_MAGIC_V2,
-                         12 + len(body),  # 12 = magic + length + flags
+                         12 + len(body),
                          HAS_FS_DESC | HAS_HS_DESC | HAS_SS_DESC)
     return header + body
 
 
 def build_strings():
-    """Build FunctionFS strings blob."""
     lang = 0x0409
-    strs = ['UDF Gadget\x00']
-    str_data = strs[0].encode('utf-8')
-    count = 1
-    # Header: magic(4) + length(4) + str_count(4) + lang(4) + strings
+    str_data = b'UDF Gadget\x00'
     body = struct.pack('<I', lang) + str_data
-    header = struct.pack('<III', STRINGS_MAGIC, 12 + len(body), count)
+    header = struct.pack('<III', STRINGS_MAGIC, 12 + len(body), 1)
     return header + body
 
 
@@ -99,7 +89,6 @@ class GadgetDaemon:
         self.running = False
         self.tx_queue = queue.Queue()
         self.rx_queue = queue.Queue()
-        # Stats
         self.frames_rx = 0
         self.frames_tx = 0
         self.bytes_rx = 0
@@ -118,30 +107,67 @@ class GadgetDaemon:
         fd0 = os.open(ep0_path, os.O_RDWR)
         os.write(fd0, build_descriptors())
         os.write(fd0, build_strings())
+        self.ep0_fd = fd0
 
-        # Wait for endpoint files to appear
+        # Wait for BIND and ENABLE events before opening endpoints
+        self._wait_for_enable()
+
         ep1_path = os.path.join(self.ffs_dir, 'ep1')
         ep2_path = os.path.join(self.ffs_dir, 'ep2')
         for _ in range(50):
             if os.path.exists(ep1_path) and os.path.exists(ep2_path):
                 break
             time.sleep(0.1)
+        else:
+            raise RuntimeError("Endpoint files did not appear")
 
         self.ep1_fd = os.open(ep1_path, os.O_WRONLY)
         self.ep2_fd = os.open(ep2_path, os.O_RDONLY)
-        self.ep0_fd = fd0
 
-        print(f"[UDF] Gadget daemon started, node_id={self.node_id}, ffs={self.ffs_dir}")
+        print(f"[UDF] Gadget started, node_id={self.node_id}, ffs={self.ffs_dir}")
 
-        # Launch threads
         self._threads = [
             threading.Thread(target=self._rx_loop, name='rx', daemon=True),
             threading.Thread(target=self._tx_loop, name='tx', daemon=True),
             threading.Thread(target=self._hb_loop, name='hb', daemon=True),
             threading.Thread(target=self._stats_loop, name='stats', daemon=True),
+            threading.Thread(target=self._ep0_loop, name='ep0', daemon=True),
         ]
         for t in self._threads:
             t.start()
+
+    def _wait_for_enable(self):
+        """Read ep0 events until FUNCTIONFS_ENABLE (or timeout)."""
+        for _ in range(50):  # 5 seconds max
+            try:
+                data = os.read(self.ep0_fd, FFS_EVENT_SIZE)
+                if len(data) >= 1:
+                    event_type = data[0]
+                    if self.verbose:
+                        print(f"[UDF] ep0 event: {event_type}")
+                    if event_type == FUNCTIONFS_ENABLE:
+                        return
+            except OSError:
+                pass
+            time.sleep(0.1)
+        print("[UDF] WARNING: ENABLE event not received, proceeding anyway")
+
+    def _ep0_loop(self):
+        """Handle ep0 control events (SUSPEND, RESUME, DISABLE)."""
+        while self.running:
+            try:
+                data = os.read(self.ep0_fd, FFS_EVENT_SIZE)
+                if data:
+                    event_type = data[0]
+                    if self.verbose:
+                        print(f"[UDF] ep0 event: {event_type}")
+                    if event_type == FUNCTIONFS_DISABLE:
+                        print("[UDF] USB disabled (cable unplugged?)")
+                    elif event_type == FUNCTIONFS_ENABLE:
+                        print("[UDF] USB re-enabled")
+            except OSError:
+                if self.running:
+                    time.sleep(0.1)
 
     def stop(self):
         self.running = False
@@ -154,7 +180,7 @@ class GadgetDaemon:
 
     def _rx_loop(self):
         """Read frames from ep2 (bulk OUT, host-to-device)."""
-        buf_size = 16388  # max frame size
+        buf_size = 16388
         while self.running:
             try:
                 data = os.read(self.ep2_fd, buf_size)
@@ -170,8 +196,8 @@ class GadgetDaemon:
                 self.bytes_rx += len(data)
 
             try:
-                hdr = frame.unpack(data)
-            except Exception:
+                f = frame.unpack(data)
+            except ValueError:
                 with self._lock:
                     self.crc_errors += 1
                 if self.verbose:
@@ -180,36 +206,29 @@ class GadgetDaemon:
 
             with self._lock:
                 self.frames_rx += 1
-                # Sequence gap detection
-                if hdr.get('seq', 0) > self.expected_seq:
+                if f.seq > self.expected_seq:
                     self.seq_gaps += 1
-                    self.expected_seq = hdr['seq'] + 1
-                elif hdr.get('seq', 0) == self.expected_seq:
+                    self.expected_seq = f.seq + 1
+                elif f.seq == self.expected_seq:
                     self.expected_seq += 1
-                # else: duplicate, ignore
 
-            # Route: if dest is us or broadcast, deliver locally
-            dest = hdr.get('dst', self.node_id)
-            if dest == self.node_id or dest == 0xFF:
-                self.rx_queue.put(hdr)
-            elif hdr.get('hops', 0) < 15:
-                # Forward
-                self.tx_queue.put(data)
+            # Route: deliver locally or forward
+            if f.dst == self.node_id or f.dst == 0xFF:
+                self.rx_queue.put(f)
+            elif f.hop < 15:
+                # Forward: increment hop, set FWD flag, re-pack with new seq
+                fwd = frame.pack(src=f.src, dst=f.dst, seq=self._next_seq(),
+                                 payload=f.payload, flags=f.flags | frame.FLAG_FWD,
+                                 hop=f.hop + 1)
+                self.tx_queue.put(fwd)
 
     def _tx_loop(self):
-        """Write frames from send queue to ep1 (bulk IN, device-to-host)."""
+        """Write pre-packed frame bytes from queue to ep1 (bulk IN)."""
         while self.running:
             try:
-                item = self.tx_queue.get(timeout=0.05)
+                data = self.tx_queue.get(timeout=0.05)
             except queue.Empty:
                 continue
-
-            # item can be raw bytes (forwarding) or a dict to pack
-            if isinstance(item, (bytes, bytearray)):
-                data = bytes(item)
-            else:
-                data = frame.pack(**item)
-
             try:
                 os.write(self.ep1_fd, data)
                 with self._lock:
@@ -220,22 +239,11 @@ class GadgetDaemon:
                     time.sleep(0.01)
 
     def _hb_loop(self):
-        """Send heartbeat frames every 100ms."""
+        """Enqueue heartbeat frames every 100ms (goes through tx_queue)."""
         while self.running:
-            hb = frame.pack(
-                flags=FLAG_HB,
-                seq=self._next_seq(),
-                src=self.node_id,
-                dst=0xFF,
-                payload=b'',
-            )
-            try:
-                os.write(self.ep1_fd, hb)
-                with self._lock:
-                    self.frames_tx += 1
-                    self.bytes_tx += len(hb)
-            except OSError:
-                pass
+            hb = frame.make_heartbeat(src=self.node_id, seq=self._next_seq(),
+                                      dst=self.node_id)
+            self.tx_queue.put(hb)
             time.sleep(0.1)
 
     def _next_seq(self):
@@ -245,7 +253,6 @@ class GadgetDaemon:
             return seq
 
     def _stats_loop(self):
-        """Log stats every 5 seconds."""
         while self.running:
             time.sleep(5)
             with self._lock:
@@ -255,36 +262,27 @@ class GadgetDaemon:
 
     def send(self, dst, payload):
         """Enqueue a data frame for transmission."""
-        self.tx_queue.put({
-            'flags': 0,
-            'seq': self._next_seq(),
-            'src': self.node_id,
-            'dst': dst,
-            'payload': payload,
-        })
+        data = frame.pack(src=self.node_id, dst=dst, seq=self._next_seq(),
+                          payload=payload)
+        self.tx_queue.put(data)
 
 
 def main():
     parser = argparse.ArgumentParser(description='UDF gadget daemon')
-    parser.add_argument('--ffs-dir', default='/tmp/udf_ffs',
-                        help='FunctionFS mount point')
-    parser.add_argument('--node-id', type=int, default=1,
-                        help='Node ID (1-254)')
-    parser.add_argument('--verbose', action='store_true',
-                        help='Verbose logging')
+    parser.add_argument('--ffs-dir', default='/tmp/udf_ffs')
+    parser.add_argument('--node-id', type=int, default=1)
+    parser.add_argument('--verbose', action='store_true')
     args = parser.parse_args()
 
     daemon = GadgetDaemon(args.ffs_dir, args.node_id, args.verbose)
 
-    def _shutdown(sig, _frame):
+    def _shutdown(sig, _):
         daemon.stop()
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
     daemon.start()
-
-    # Block main thread until shutdown
     while daemon.running:
         time.sleep(0.5)
 
