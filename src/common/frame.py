@@ -7,7 +7,7 @@ This eliminates short-packet ambiguity at the USB transfer boundary.
 Authenticated mode (v1.1): appends a 16-byte HMAC-SHA256 tag between
 payload and CRC. Negotiated during CAP exchange via Features bit 3.
 """
-import struct, zlib, hmac, hashlib
+import struct, zlib, hmac
 from dataclasses import dataclass
 
 MAGIC = b'UF'
@@ -90,9 +90,11 @@ def unpack(data: bytes) -> Frame:
 
 # --- Convenience constructors ---
 
-def make_heartbeat(src: int, seq: int) -> bytes:
-    """Pack a heartbeat: normal frame with HB flag, zero payload. Always 20 bytes."""
-    return pack(src=src, dst=0, seq=seq, flags=FLAG_HB)
+def make_heartbeat(src: int, seq: int, dst: int = 0) -> bytes:
+    """Pack a heartbeat: normal frame with HB flag, zero payload. Always 20 bytes.
+    dst defaults to 0 (unassigned) for backward compat; in ring topologies
+    implementations SHOULD set dst to the neighbor's node ID."""
+    return pack(src=src, dst=dst, seq=seq, flags=FLAG_HB)
 
 
 def make_syn(src: int, dst: int, seq: int) -> bytes:
@@ -109,7 +111,7 @@ def make_cap(src: int, dst: int, seq: int, node_name: str,
     Name is truncated to 9 bytes + null terminator if longer."""
     name_bytes = node_name.encode('utf-8')[:9]  # truncate to 9, leave room for null
     name_field = name_bytes.ljust(10, b'\x00')  # 10 bytes, null-padded
-    cap_payload = struct.pack('<HH BB', version, max_frame, src, features) + name_field
+    cap_payload = struct.pack('<HHBB', version, max_frame, src, features) + name_field
     return pack(src=src, dst=dst, seq=seq, payload=cap_payload, flags=FLAG_CAP)
 
 
@@ -142,19 +144,19 @@ def unpack_frame(data: bytes):
 # --- Authenticated Mode (v1.1) ---
 
 AUTH_TAG_SIZE = 16  # HMAC-SHA256 truncated to 128 bits
-MAX_PAYLOAD_AUTH = MAX_PAYLOAD - AUTH_TAG_SIZE - _pad16(AUTH_TAG_SIZE)  # 16336 bytes
+MAX_PAYLOAD_AUTH = MAX_PAYLOAD - AUTH_TAG_SIZE  # 16352 bytes
 
 
 def derive_link_key(psk: bytes, src_id: int, dst_id: int, nonce: bytes = b'\x00' * 4) -> bytes:
     """Derive a per-link key from the PSK using HKDF-like construction.
     link_key = HMAC-SHA256(PSK, src_id || dst_id || nonce)"""
     material = struct.pack('BB', src_id, dst_id) + nonce
-    return hmac.new(psk, material, hashlib.sha256).digest()
+    return hmac.digest(psk, material, 'sha256')
 
 
 def _compute_tag(key: bytes, header: bytes, padded_payload: bytes) -> bytes:
     """HMAC-SHA256(key, header || padded_payload), truncated to 16 bytes."""
-    return hmac.new(key, header + padded_payload, hashlib.sha256).digest()[:AUTH_TAG_SIZE]
+    return hmac.digest(key, header + padded_payload, 'sha256')[:AUTH_TAG_SIZE]
 
 
 def pack_authenticated(src: int, dst: int, seq: int, payload: bytes,
@@ -230,8 +232,7 @@ if __name__ == '__main__':
     cap = make_cap(src=1, dst=2, seq=1, node_name='a-very-long-hostname-that-exceeds-ten-bytes')
     cf = unpack(cap)
     info = parse_cap(cf.payload)
-    assert len(info['name']) <= 9  # truncated
-    assert info['name'] == 'a-very-lo'  # 9 bytes max
+    assert info['name'] == 'a-very-lo'  # truncated to exactly 9 bytes
 
     # Tuple API compat
     assert unpack_frame(f) == (0, 42, 1, 2, b'Hello UDF')
